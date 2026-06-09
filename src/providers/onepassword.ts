@@ -17,6 +17,10 @@ import { Notice, Setting, requestUrl } from "obsidian";
 
 import { renderAuthStatusRow } from "../authStatusRow";
 import {
+  decryptStringWithPassphrase,
+  encryptStringWithPassphrase,
+} from "../crypto/passphraseEncryption";
+import {
   NoteContext,
   PluginContext,
   Provider,
@@ -51,18 +55,28 @@ interface OpItem {
 
 export interface OnePasswordSettings {
   baseUrl: string;
-  /** Connect token (long-lived).  Stored as-is when rememberToken is on. */
-  token: string | null;
   defaultVault: string;
   cacheTtlSec: number;
+  /** True if the user opted in to remembering the token on this device. */
+  rememberToken: boolean;
+  /** Base64-encoded AES-GCM blob (salt || iv || ciphertext) of the Connect
+   *  token.  Null unless rememberToken is on and a passphrase was supplied. */
+  encryptedToken: string | null;
 }
 
 const DEFAULTS: OnePasswordSettings = {
   baseUrl: "",
-  token: null,
   defaultVault: "",
   cacheTtlSec: 300,
+  rememberToken: false,
+  encryptedToken: null,
 };
+
+/** Shape of pre-0.6.2 persisted data, which stored the Connect token in
+ *  plaintext.  Used only to migrate it off disk on first load. */
+interface LegacyOnePasswordSettings {
+  token?: string | null;
+}
 
 // {{1p:<vault>/<item>#<field>}}
 // Permissive on inner characters because vault/item names can contain
@@ -300,6 +314,9 @@ export class OnePasswordProvider implements Provider {
   readonly placeholderRegex = PLACEHOLDER_RE;
 
   private settings: OnePasswordSettings = { ...DEFAULTS };
+  /** Connect token.  In memory only by default; persisted (encrypted under a
+   *  passphrase) only when rememberToken is on. */
+  private token: string | null = null;
   private client: OnePasswordClient;
   auth: ProviderAuth;
 
@@ -308,13 +325,13 @@ export class OnePasswordProvider implements Provider {
   constructor(private ctx: PluginContext) {
     this.client = new OnePasswordClient(
       () => this.settings.baseUrl,
-      () => this.settings.token,
+      () => this.token,
       () => this.settings.cacheTtlSec,
     );
 
     this.auth = {
       status: async (): Promise<ProviderAuthStatus> => {
-        if (!this.settings.token || !this.settings.baseUrl) {
+        if (!this.token || !this.settings.baseUrl) {
           return { loggedIn: false };
         }
         try {
@@ -328,8 +345,7 @@ export class OnePasswordProvider implements Provider {
       login: async () => {
         return new Promise<void>((resolve) => {
           new TokenPromptModal(this.ctx.app, async (token) => {
-            this.settings.token = token;
-            await this.persist();
+            await this.setToken(token);
             try {
               await this.client.listVaults();
               new Notice("1Password Connect: logged in");
@@ -345,8 +361,7 @@ export class OnePasswordProvider implements Provider {
         });
       },
       logout: async () => {
-        this.settings.token = null;
-        await this.persist();
+        await this.clearToken();
         this.client.clearCache();
         this.ctx.notifyAuthChanged(this.id);
         this.notify();
@@ -356,6 +371,53 @@ export class OnePasswordProvider implements Provider {
         return () => this.listeners.delete(cb);
       },
     };
+  }
+
+  /** Set the in-memory token and, if remember-on-device is enabled, encrypt
+   *  it under a user passphrase and persist the blob. */
+  private async setToken(token: string): Promise<void> {
+    this.token = token.trim();
+    if (this.settings.rememberToken) {
+      const passphrase = await this.ctx.promptPassphrase(
+        "Encrypt token with passphrase",
+      );
+      if (passphrase) {
+        this.settings.encryptedToken = await encryptStringWithPassphrase(
+          this.token,
+          passphrase,
+        );
+      }
+    }
+    await this.persist();
+  }
+
+  private async clearToken(): Promise<void> {
+    this.token = null;
+    this.settings.encryptedToken = null;
+    await this.persist();
+  }
+
+  /** Restore an encrypted remembered token, prompting for the passphrase.
+   *  Returns true on success. */
+  private async tryRestore(): Promise<boolean> {
+    if (!this.settings.rememberToken || !this.settings.encryptedToken) {
+      return false;
+    }
+    const passphrase = await this.ctx.promptPassphrase(
+      "Decrypt remembered token",
+    );
+    if (!passphrase) return false;
+    try {
+      this.token = await decryptStringWithPassphrase(
+        this.settings.encryptedToken,
+        passphrase,
+      );
+      this.ctx.notifyAuthChanged(this.id);
+      this.notify();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private notify(): void {
@@ -369,8 +431,29 @@ export class OnePasswordProvider implements Provider {
   }
 
   async init(): Promise<void> {
-    const saved = await this.ctx.loadProviderData<OnePasswordSettings>(this.id);
-    if (saved) this.settings = { ...DEFAULTS, ...saved };
+    const saved = await this.ctx.loadProviderData<
+      OnePasswordSettings & LegacyOnePasswordSettings
+    >(this.id);
+    if (saved) {
+      // Reconstruct settings from known keys only, so a legacy plaintext
+      // `token` field is never written back to disk.
+      this.settings = {
+        baseUrl: saved.baseUrl ?? DEFAULTS.baseUrl,
+        defaultVault: saved.defaultVault ?? DEFAULTS.defaultVault,
+        cacheTtlSec: saved.cacheTtlSec ?? DEFAULTS.cacheTtlSec,
+        rememberToken: saved.rememberToken ?? DEFAULTS.rememberToken,
+        encryptedToken: saved.encryptedToken ?? DEFAULTS.encryptedToken,
+      };
+      // Migrate a pre-0.6.2 plaintext token: load it into memory for this
+      // session and strip it from disk.  To re-persist it the user must
+      // re-enable "remember token", which encrypts under a passphrase.
+      if (typeof saved.token === "string" && saved.token.length > 0) {
+        this.token = saved.token;
+        await this.persist();
+      }
+    }
+    // Restore an encrypted remembered token (prompts for the passphrase).
+    void this.tryRestore();
   }
 
   private async persist(): Promise<void> {
@@ -410,7 +493,7 @@ export class OnePasswordProvider implements Provider {
   }
 
   async list(): Promise<ProviderRef[]> {
-    if (!this.settings.token || !this.settings.baseUrl) return [];
+    if (!this.token || !this.settings.baseUrl) return [];
     const out: ProviderRef[] = [];
     const vaults: OpVault[] = await this.client
       .listVaults()
@@ -501,5 +584,35 @@ export class OnePasswordProvider implements Provider {
         }),
       );
 
+    new Setting(containerEl)
+      .setName("Remember token on this device")
+      .setDesc(
+        "Encrypts the Connect token with a passphrase and stores it in plugin data. Off by default; the token is kept in memory only.",
+      )
+      .addToggle((t) =>
+        t.setValue(this.settings.rememberToken).onChange(async (v) => {
+          this.settings.rememberToken = v;
+          if (!v) {
+            // Stop remembering: drop the encrypted blob from disk.
+            this.settings.encryptedToken = null;
+          } else if (this.token) {
+            // Enabled while logged in: encrypt the current token now.
+            const passphrase = await this.ctx.promptPassphrase(
+              "Encrypt token with passphrase",
+            );
+            if (passphrase) {
+              this.settings.encryptedToken = await encryptStringWithPassphrase(
+                this.token,
+                passphrase,
+              );
+            } else {
+              // Cancelled - don't half-enable; revert the toggle.
+              this.settings.rememberToken = false;
+              t.setValue(false);
+            }
+          }
+          await this.persist();
+        }),
+      );
   }
 }

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- **1Password Connect token is no longer stored in plaintext.** It is now
+  kept in memory by default and persisted only when "Remember token on this
+  device" is enabled, encrypted under a user passphrase with AES-GCM
+  (PBKDF2-HMAC-SHA256, 200k iterations) — the same scheme the OpenBao and
+  Bitwarden providers already use. Any plaintext token written to plugin
+  data by an earlier build is migrated off disk on first load; re-enable
+  "Remember token" to persist it encrypted.
+
 ## 0.6.0
 
 First community-store release.

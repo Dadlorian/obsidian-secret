@@ -90,7 +90,16 @@ confirmation-gated. This upholds the hard invariant stated in `CLAUDE.md`.
 
 ## Findings
 
-### FINDING-1 (Medium) — 1Password Connect token stored in plaintext at rest
+### FINDING-1 (Medium) — 1Password Connect token stored in plaintext at rest — RESOLVED
+
+> **Status: RESOLVED** on branch `claude/keen-fermi-deck11`. The 1Password
+> provider now keeps the token in memory by default and persists it only when
+> "Remember token on this device" is enabled, encrypted under a passphrase
+> (AES-GCM via `src/crypto/passphraseEncryption.ts`), matching OpenBao and
+> Bitwarden. Any pre-existing plaintext token is migrated off disk on first
+> load. See the CHANGELOG "Unreleased" entry. The original finding is kept
+> below for the record.
+
 
 **Where:** `src/providers/onepassword.ts`
 (`OnePasswordSettings.token`, `persist()` at ~L376, login handler ~L331).
@@ -173,7 +182,7 @@ into `<vault>/.obsidian/plugins/secret-placeholders/`.
 
 | # | Severity | Action |
 |---|----------|--------|
-| 1 | Medium | Encrypt the 1Password Connect token at rest (or keep it in memory only) to match the documented model. |
+| 1 | Medium | ~~Encrypt the 1Password Connect token at rest (or keep it in memory only) to match the documented model.~~ **DONE** — encrypted opt-in, in-memory by default, plaintext migrated off disk. |
 | 2 | Low/Info | Make OIDC loopback bind host and advertised `redirect_uri` consistent. |
 | 3 | Info | Build from source for self-hosting; keep `data.json` out of publish/backup exposure. |
 
