@@ -183,8 +183,80 @@ into `<vault>/.obsidian/plugins/secret-placeholders/`.
 | # | Severity | Action |
 |---|----------|--------|
 | 1 | Medium | ~~Encrypt the 1Password Connect token at rest (or keep it in memory only) to match the documented model.~~ **DONE** — encrypted opt-in, in-memory by default, plaintext migrated off disk. |
-| 2 | Low/Info | Make OIDC loopback bind host and advertised `redirect_uri` consistent. |
-| 3 | Info | Build from source for self-hosting; keep `data.json` out of publish/backup exposure. |
+| 2 | Low/Info | Make OIDC loopback bind host and advertised `redirect_uri` consistent. **Not yet applied** — see "Remaining changes" below. |
+| 3 | Info | Build from source for self-hosting; keep `data.json` out of publish/backup exposure. **Operational, no code change.** |
+
+---
+
+## Remaining changes — where and why (not yet applied)
+
+These are the open items, written as a pick-up guide. None are blocking; #2
+is a small correctness/robustness fix and #3 is operational guidance.
+
+### REC-2 (Low) — OIDC loopback: bind host vs. advertised `redirect_uri`
+
+**File:** `src/providers/openbao/oidcLogin.ts`
+
+**Where:**
+- `oidcLogin.ts:40` — `redirectUri` is built as
+  `http://localhost:${port}/oidc/callback` (advertised to the IdP).
+- `oidcLogin.ts:131` — the listener binds with `server.listen(port, "127.0.0.1")`.
+- `oidcLogin.ts:107` — the callback URL is parsed against
+  `http://localhost:${port}`.
+
+**Why it matters:** the advertised redirect uses the hostname `localhost`
+while the socket is bound to the IPv4 literal `127.0.0.1`. On most machines
+these coincide, but where `localhost` resolves to IPv6 `::1` first, the
+browser's redirect can land on `[::1]:<port>` while nothing is listening
+there — the login silently hangs until the timeout. It is also an OAuth
+correctness nit: the bind address and the `redirect_uri` host should match.
+
+**Suggested change (pick one, keep all three references in sync):**
+- *Preferred:* advertise `127.0.0.1` everywhere — set
+  `redirectUri = http://127.0.0.1:${port}/oidc/callback` (line 40) and parse
+  against the same base (line 107). This matches the existing bind and is the
+  most common loopback convention for OAuth native apps.
+- *Alternative:* bind to `localhost` instead of `127.0.0.1` (line 131) and
+  leave the URLs as-is — but this is less deterministic across IPv4/IPv6.
+
+**Note:** OpenBao/Vault roles whitelist exact `allowed_redirect_uris`, so if
+this string changes, the server-side role config must list the new value.
+Worth calling out in the OIDC setup docs alongside the change.
+
+**Risk:** low. Desktop-only path; no secret-handling change; purely affects
+which loopback address the IdP redirects to.
+
+### REC-3 (Info) — operational guidance, no code change
+
+- **Build from source for self-hosting.** `npm install && npm run build`
+  produces `main.js` from source you can read, which is strictly stronger
+  than trusting a release binary. (Note: the review/CI container here blocks
+  the npm registry, so this must be run somewhere with registry access.)
+- **Treat `data.json` as sensitive.** It lives at
+  `<vault>/.obsidian/plugins/secret-placeholders/data.json` and holds
+  encrypted token blobs. Keep it out of any vault *publish* pipeline and
+  treat it as secret material in backups. Consider documenting this in
+  `docs/security.md` under "Permissions & data access".
+- **Strip placeholders on publish** as defense-in-depth — a leaked
+  placeholder reveals a secret *path*, not its value, but paths can be
+  sensitive.
+
+### Verification still owed on REC-1 (the applied fix)
+
+The FINDING-1 fix was verified by inspection only; the build/typecheck could
+not run here because the environment blocks the npm registry. Before tagging
+a release, run on a network-enabled machine:
+
+```bash
+npm install
+npm run typecheck
+npm run build
+```
+
+and smoke-test the 1Password flow: log in, toggle *Remember token on this
+device* (confirm a passphrase prompt and that `data.json` contains an
+`encryptedToken` blob, **not** a plaintext `token`), restart Obsidian, and
+confirm the decrypt-on-restore prompt appears.
 
 ## Files examined
 
